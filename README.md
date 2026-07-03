@@ -4,7 +4,8 @@ A Kubernetes dashboard for the [macros](https://github.com/kylegwinnup/macros)
 editor, written in Steel — a magit-style porcelain for `kubectl`.
 
 One read-only, foldable status buffer shows the current context and namespace at
-a glance: nodes, deployments, pods (grouped by workload), services, and recent
+a glance: nodes, deployments, autoscalers (HPAs), pods (grouped by workload),
+services, and recent
 warning events. Status is color-coded (green ok / yellow pending / red failing),
 and point-and-key actions give you describe, logs, YAML, a pod shell, scale, and
 delete without leaving the buffer.
@@ -72,7 +73,7 @@ In the `*k8s-dashboard*` buffer:
 | `d`          | `kubectl describe` the resource at point → `*k8s-describe*`               |
 | `l`          | logs — the last `*k8s-log-tail*` lines (default 500)                      |
 | `s`          | **pod:** open a shell (`exec -it`) in a half-screen terminal · **deployment:** scale |
-| `y`          | `get -o yaml` the resource at point → `*k8s-yaml*`                        |
+| `y`          | `get -o yaml` the resource at point, in a real yaml buffer (see below)   |
 | `x`          | delete the pod at point (confirms first)                                 |
 | `Y`          | copy the resource name at point to the clipboard                         |
 | `N`          | switch namespace (completion)                                            |
@@ -83,12 +84,24 @@ In the `*k8s-dashboard*` buffer:
 | `q`          | close the buffer                                                         |
 
 `d`, `l`, `y`, `s`, `x`, and `Y` act on the resource on the current line — put
-point on a pod, deployment, or node row. Nodes are cluster-scoped; everything
-else acts in the row's namespace.
+point on a pod, deployment, autoscaler, or node row. Nodes are cluster-scoped;
+everything else acts in the row's namespace.
 
-In the `*k8s-describe*` / `*k8s-yaml*` / logs buffers: `yy` copies the current
-line, `Y` copies the whole buffer, `q` closes it, and evil/helix read-only motion
-works.
+The `y` (YAML) buffer is a normal editable buffer in yaml-mode — every keymap
+works there as it does in any file: full motion, `/` search, native `yy` yank
+(see [YAML](#yaml)). The `*k8s-describe*` and logs buffers are read-only views:
+`yy` copies the current line, `Y` copies the whole buffer, `q` closes them, and
+evil/helix read-only motion works.
+
+## Autoscalers (HPA)
+
+The **Autoscalers** section lists `HorizontalPodAutoscaler` objects (`kubectl get
+hpa`). An HPA is a separate resource that scales a workload (its `scaleTargetRef`,
+usually a Deployment) — its config is *not* part of the pod's or deployment's
+YAML, which is why `y` on a pod never shows it. Point at an HPA row and `d` /
+`y` describe it or open its YAML (min/max replicas, target metrics, behavior). A
+row turns red when the HPA can't read its metrics (`<unknown>` targets — the
+`FailedGetResourceMetric` case).
 
 ## Grouping
 
@@ -136,6 +149,15 @@ defaults to `/bin/bash`; change it with the `k8s-shell` option (see
 On a **deployment**, `s` scales instead (prompts for a replica count), so the one
 key does the sensible thing for whatever's under point.
 
+## YAML
+
+`y` writes the resource's `-o yaml` to a temp `.yaml` file and opens it as a
+**normal** buffer. Because it's a real file (not a special read-only view), it
+auto-detects into yaml highlighting and every keymap works exactly as it does in
+any file — full evil/helix/emacs motion, `/` search, `yy` yank, marks, the lot.
+Re-running `y` on the same resource re-reads the current YAML in place. The temp
+files live under `$TMPDIR/macros-k8s/`.
+
 ## Logs
 
 `l` on a pod opens the last `*k8s-log-tail*` lines (default 500) in a read-only
@@ -145,7 +167,8 @@ key does the sensible thing for whatever's under point.
 
 With point on a resource, `?` opens a transient menu of the actions available on
 it — pods offer describe / yaml / logs / shell / delete, deployments offer
-describe / yaml / scale, nodes offer describe / yaml. Off a resource, `?` shows a
+describe / yaml / scale, autoscalers and nodes offer describe / yaml. Off a
+resource, `?` shows a
 view menu (refresh, namespace, all-namespaces, context, auto-refresh). Press a
 key to run it; `q`, `Esc`, or `C-g` dismiss it.
 
@@ -165,11 +188,13 @@ it too): only *motion* is layered on, so the visual `y` operator never runs and 
 yank reaches neither the kill-ring nor the OS clipboard. macros-k8s binds explicit
 copy commands instead, all via `clipboard-set` (so `cmd-v` in another app works):
 
-| Buffer                 | Key  | Copies                        |
-| ---------------------- | ---- | ----------------------------- |
-| dashboard              | `Y`  | the resource name under point |
-| describe / yaml / logs | `yy` | the current line              |
-| describe / yaml / logs | `Y`  | the whole buffer              |
+| Buffer            | Key  | Copies                        |
+| ----------------- | ---- | ----------------------------- |
+| dashboard         | `Y`  | the resource name under point |
+| describe / logs   | `yy` | the current line              |
+| describe / logs   | `Y`  | the whole buffer              |
+
+(The YAML buffer is a normal buffer, so vim/helix `y` yank works there natively.)
 
 ## Configuration
 

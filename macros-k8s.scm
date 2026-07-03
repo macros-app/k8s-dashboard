@@ -130,12 +130,17 @@
 (define (k8s--ratio-face s)
   (let ((p (split-many s "/")))
     (if (and (= (length p) 2) (equal? (car p) (cadr p))) "k8s-ok" "k8s-warn")))
+;; HPA TARGETS column, e.g. "45%/80%" or "<unknown>/50%" — red when it can't read
+;; metrics (the FailedGetResourceMetric case), else ok.
+(define (k8s--hpa-face s)
+  (if (string-contains? s "unknown") "k8s-err" "k8s-ok"))
 
 ;; Whole-line face for a resource row, dispatched by kind on its status string.
 (define (k8s--status-face kind s)
   (cond ((equal? kind "pod")        (k8s--phase-face s))
         ((equal? kind "deployment") (k8s--ratio-face s))
         ((equal? kind "node")       (k8s--node-face s))
+        ((equal? kind "hpa")        (k8s--hpa-face s))
         (else                       "k8s-dim")))
 ;; The most severe face in a set (for a group heading summarizing its pods).
 (define (k8s--worst-face faces)
@@ -385,6 +390,7 @@
     (k8s--emit-header)
     (k8s--emit-nodes)
     (k8s--emit-table 'k8s-deploys "Deployments" "deployment" #t (list "get" "deployments")       1)
+    (k8s--emit-table 'k8s-hpa     "Autoscalers" "hpa"        #t (list "get" "hpa")                2)
     (k8s--emit-pods)
     (k8s--emit-table 'k8s-svcs    "Services"    "service"    #t (list "get" "services")          0)
     (k8s--emit-events)
@@ -453,13 +459,28 @@
                          (if (k8s--blank? out) "(no output)" (trim-end out)) '()))
         (message "k8s: point is not on a resource"))))
 
+;; YAML opens in a REAL file buffer (a temp `.yaml`), not a special render-buffer,
+;; so it auto-detects into yaml highlighting AND every keymap works normally —
+;; evil/helix/emacs motion, `/` search, native `yy` yank, the lot. A render-buffer
+;; is "special" and only gets the motion overlay, so search etc. wouldn't work.
+(define (k8s--tmpdir)
+  (let ((t (getenv "TMPDIR")))
+    (cond ((equal? t "") "/tmp")
+          ((ends-with? t "/") (substring t 0 (- (string-length t) 1)))
+          (else t))))
+(define (k8s--yaml-slug ns kind name)
+  (string-append (if (equal? ns "") "cluster" ns) "-" kind "-" name ".yaml"))
 (define-command (k8s-yaml)
   (let ((r (k8s--resource-at)))
     (if r
-        (let ((out (k8s--run (append (list "get" (nth r 1) (nth r 2) "-o" "yaml")
-                                     (k8s--ns-args-for r)))))
-          (render-buffer "*k8s-yaml*" "yaml"
-                         (if (k8s--blank? out) "(no output)" (trim-end out)) '()))
+        (let* ((kind (nth r 1)) (name (nth r 2)) (ns (nth r 3))
+               (out  (k8s--run (append (list "get" kind name "-o" "yaml")
+                                       (k8s--ns-args-for r))))
+               (slug (k8s--yaml-slug ns kind name))
+               (path (string-append (k8s--tmpdir) "/macros-k8s/" slug)))
+          (write-file path (if (k8s--blank? out) "# (no output)\n" (trim-end out)))
+          (kill-buffer-named slug)   ; drop a stale view so find-file re-reads
+          (open-file path))
         (message "k8s: point is not on a resource"))))
 
 ;; ── logs (last *k8s-log-tail* lines) ──────────────────────────────────────────
@@ -590,6 +611,12 @@
                     (list "q" "Close"          'transient-quit)))))
      ((and r (equal? (nth r 1) "node"))
       (transient (string-append "Node: " (nth r 2))
+        (list (list "Inspect"
+                    (list "d" "Describe"       'k8s-describe)
+                    (list "y" "YAML"           'k8s-yaml)
+                    (list "q" "Close"          'transient-quit)))))
+     ((and r (equal? (nth r 1) "hpa"))
+      (transient (string-append "HPA: " (nth r 2) "  (" (nth r 3) ")")
         (list (list "Inspect"
                     (list "d" "Describe"       'k8s-describe)
                     (list "y" "YAML"           'k8s-yaml)
