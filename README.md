@@ -24,23 +24,28 @@ shell), `lib-transient` (the `?` popup), and `run-with-timer` (auto-refresh).
 
 ## Install
 
-Clone this repo somewhere and install it from your `init.scm`:
+Add this to your `init.scm` — the package is cloned from git on first launch (the
+entry file is `macros-k8s.scm`, so name it explicitly since the repo is
+`k8s-dashboard`):
 
 ```scheme
-(package-install-local "/path/to/macros-k8s")
+(package-install "https://codeberg.org/macros-app/k8s-dashboard"
+  'entry "macros-k8s.scm")
 ```
 
-To use `/bin/sh` instead of the default `/bin/bash` for the pod shell, do it in
+To use `/bin/sh` instead of the default `/bin/bash` for the pod shell, set it in
 the package's `'config` thunk (runs after the package loads):
 
 ```scheme
-(package-install-local "/path/to/macros-k8s"
+(package-install "https://codeberg.org/macros-app/k8s-dashboard"
+  'entry  "macros-k8s.scm"
   'config (lambda () (set-option "k8s-shell" "/bin/sh")))
 ```
 
-`package-install-local` loads the package in place and registers the tree for the
-editor-aware `macros-scheme` LSP. (A plain `(load
-"/path/to/macros-k8s/macros-k8s.scm")` also works but skips the LSP registration.)
+The repo is cloned only when its directory is absent, so only the first launch
+touches the network. Pin a version with `'ref "v1.0.0"` (a tag, branch, or
+commit); it's re-checked-out on every launch, so bumping it in `init.scm` re-pins
+on the next start.
 
 ## Launch
 
