@@ -502,7 +502,8 @@
     (split-window-below)                     ; half-height pane across the bottom
     (other-window)                           ; move focus into it
     (make-terminal (string-append "*k8s-shell:" pod "*") *k8s-command*
-                   (list "exec" "-it" pod "-n" ns "--" sh))
+                   (list "exec" "-it" pod "-n" ns "--" sh)
+                   "")                       ; "" → the active buffer's directory
     (message (string-append "shell → " pod " (" ns ") : " sh))))
 (define-command (k8s-shell)
   (let ((r (k8s--resource-at)))
