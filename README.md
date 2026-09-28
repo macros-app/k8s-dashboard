@@ -67,12 +67,14 @@ In the `*k8s-dashboard*` buffer:
 
 | Key          | Action                                                                   |
 | ------------ | ------------------------------------------------------------------------ |
-| `r` / `g`    | refresh                                                                   |
+| `r` / `g`    | refresh (under evil/helix, `g` is a prefix: `g r` refresh, `g g` top)    |
 | `TAB` / `RET`| fold / unfold the section (or workload/pool group) at point              |
-| `j` `k` `n` `p` / arrows | move by line (your evil/helix motion works too)              |
+| `j` `k` / arrows | move by line (`n` `p` under plain Emacs)                             |
+| `G` `C-d` `C-u` `/` `n` | evil/helix: bottom, half-page, search, next match             |
 | `d`          | `kubectl describe` the resource at point → `*k8s-describe*`               |
 | `l`          | logs — the last `*k8s-log-tail*` lines (default 500)                      |
 | `s`          | **pod:** open a shell (`exec -it`) in a half-screen terminal · **deployment:** scale |
+| `S`          | **pod:** open a shell in the full window                                 |
 | `y`          | `get -o yaml` the resource at point, in a real yaml buffer (see below)   |
 | `x`          | delete the pod at point (confirms first)                                 |
 | `Y`          | copy the resource name at point to the clipboard                         |
@@ -91,7 +93,8 @@ The `y` (YAML) buffer is a normal editable buffer in yaml-mode — every keymap
 works there as it does in any file: full motion, `/` search, native `yy` yank
 (see [YAML](#yaml)). The `*k8s-describe*` and logs buffers are read-only views:
 `yy` copies the current line, `Y` copies the whole buffer, `q` closes them, and
-evil/helix read-only motion works.
+evil/helix read-only motion works (`h j k l w b e 0 $ ^ gg G C-d C-u`, plus `/` `?`
+`n` `N` search).
 
 ## Autoscalers (HPA)
 
@@ -142,9 +145,24 @@ cluster-wide.
 
 `s` on a pod splits the dashboard window in half (a terminal pane across the
 bottom) and runs `kubectl exec -it <pod> -n <ns> -- <shell>` in it, with focus in
-the shell. `C-x o` returns to the dashboard, `C-x k` kills the shell. The shell
-defaults to `/bin/bash`; change it with the `k8s-shell` option (see
-[Configuration](#configuration)).
+the shell. `S` runs the same shell in the full window instead (`C-x b` gets you
+back to the dashboard). The shell defaults to `/bin/bash`; change it with the
+`k8s-shell` option (see [Configuration](#configuration)).
+
+A terminal sends almost every key to the shell, including your plain-`SPC` leader.
+These still reach the editor:
+
+| Key | Action |
+| --- | --- |
+| `C-x o` | switch between the shell and the dashboard |
+| `C-x 1` | keep only the current pane |
+| `C-x k` | kill the shell |
+| `M-SPC …` | your evil leader chords, via the alt leader (`M-SPC n o` = your `SPC n o`) |
+| anything in `terminal-passthrough-keys` | e.g. `(set-option "terminal-passthrough-keys" "alt-o")` |
+
+When the shell exits (`exit`, the pod goes away, the connection drops), its pane
+and buffer close by themselves and you're back on the dashboard. Set
+`k8s-shell-keep-on-exit` to keep the dead buffer and its scrollback.
 
 On a **deployment**, `s` scales instead (prompts for a replica count), so the one
 key does the sensible thing for whatever's under point.
@@ -203,6 +221,8 @@ Two settings live in the editor's **option store**, so you can set them any time
 
 ```scheme
 (set-option "k8s-shell" "/bin/sh")                          ; pod shell (default /bin/bash)
+(set-option "k8s-shell-focus" "dashboard")                  ; stay on the dashboard after `s` (default "terminal")
+(set-option "k8s-shell-keep-on-exit" "true")                ; keep a dead shell's buffer (default: close it)
 (set-option "k8s-node-group-label" "topology.kubernetes.io/zone")  ; node grouping ("" = auto)
 ```
 
@@ -230,6 +250,40 @@ Faces: `k8s-header`, `k8s-section`, `k8s-ok`, `k8s-warn`, `k8s-err`, `k8s-dim`.
 > package function from `init.scm` reaches it (the function isn't defined yet when
 > `init.scm` compiles). `set-option` sidesteps all of that — it writes the
 > editor's Rust-side option map, which the package reads at use time.
+
+## Customizing keys
+
+Every key is an ordinary keymap entry, so rebind or add keys from `init.scm`. Put
+them in the package's `'config` hook (or anywhere after it loads) so they land on
+top of the defaults:
+
+```scheme
+(package-install-local "~/workspace/macros-k8s"
+  'config (lambda ()
+            ;; Emacs keys (and the base map under evil/helix)
+            (define-key "k8s-mode" "e" 'k8s-logs)
+            (define-key "k8s-detail-mode" "r" 'k8s-refresh)
+            ;; evil-only keys — the overlay wins over the base map in Normal state
+            (evil-define-key "normal" "k8s-mode" "shift-l" 'k8s-logs)))
+```
+
+| Keymap | Used for |
+| --- | --- |
+| `k8s-mode` | the dashboard — Emacs keys, and the fallback under evil/helix |
+| `k8s-detail-mode` | describe and logs buffers |
+| `evil-normal:k8s-mode` / `evil-normal:k8s-detail-mode` | evil overlays, checked first in Normal state |
+| `helix-normal:k8s-mode` / `helix-normal:k8s-detail-mode` | helix overlays, same idea |
+
+**Leader keys.** Your global evil leader chords (`evil-leader-set`) work in the
+dashboard and detail buffers, and through `M-SPC` in pod shells, with no extra
+setup. To give a chord a dashboard-only meaning, bind it per mode; it shadows the
+global one there:
+
+```scheme
+(evil-leader-set-for-modes '("k8s-mode")
+  (list (cons "k s" 'k8s-shell-full)
+        (cons "k n" 'k8s-set-namespace)))
+```
 
 ## Notes / limitations
 
