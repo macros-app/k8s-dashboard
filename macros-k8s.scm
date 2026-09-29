@@ -6,7 +6,8 @@
 ;;;   * lib-section (`section-open`/`section-line`/`section-render`) — foldable,
 ;;;     navigable read-only status buffer with persistent fold state
 ;;;   * `render-buffer` / `render-buffer-quiet` — draw detail buffers
-;;;   * `make-terminal` + `split-window-below` — `s` opens a pod shell in a pane
+;;;   * `make-terminal` + `split-window-below` — `s` opens a pod shell in a pane;
+;;;     `terminal-exit-hook` closes that pane when the shell exits
 ;;;   * `run-with-timer` — optional auto-refresh polling
 ;;;   * `completing-read` / `read-string` / `y-or-n-p` — prompts + confirms
 ;;;
@@ -42,6 +43,18 @@
 (define (k8s--shell)
   (let ((v (get-option "k8s-shell")))
     (if (and (string? v) (not (equal? v ""))) v "/bin/bash")))
+;; Where focus lands after `s` opens a pod shell: "terminal" (default — type
+;; straight away) or "dashboard" (keep browsing; `C-x o` jumps into the shell):
+;;   (set-option "k8s-shell-focus" "dashboard")
+(define (k8s--shell-focus-dashboard?)
+  (equal? (get-option "k8s-shell-focus") "dashboard"))
+;; When a pod shell exits (`exit`, pod deleted, connection dropped) its pane and
+;; buffer close automatically. Keep the dead buffer around instead with:
+;;   (set-option "k8s-shell-keep-on-exit" "true")
+;; (Opt-OUT via a truthy value: an unset option and `#f` both read back as #f.)
+(define (k8s--shell-keep-on-exit?)
+  (let ((v (get-option "k8s-shell-keep-on-exit")))
+    (or (eq? v #t) (equal? v "true"))))
 ;; Node label to group Nodes by, via the option store (read by k8s--node-group-label):
 ;;   (set-option "k8s-node-group-label" "topology.kubernetes.io/zone")
 ;; Unset / "" = auto-detect the cloud node-pool label (EKS / GKE / Karpenter /
@@ -372,7 +385,7 @@
                     (if (k8s--st 'auto) "    [auto-refresh]" ""))
      "k8s-header")
     (section-line
-     (string-append "  r refresh · TAB fold · d describe · l logs · s shell/scale · "
+     (string-append "  r refresh · TAB fold · d describe · l logs · s shell/scale · S full shell · "
                     "y yaml · x delete · N ns · A all-ns · C ctx · a auto · ? more · q quit")
      "k8s-dim")
     (section-line "" #f)))
@@ -494,21 +507,50 @@
                        (if (k8s--blank? out) "(no logs)" (trim-end out)) '())))))
 
 ;; ── shell (kubectl exec -it, in a half-screen terminal) ───────────────────────
-;; Split the dashboard window in half, drop into the new pane, and run an
-;; interactive shell inside the pod. Focus lands in the terminal so you can type;
-;; `C-x o` returns to the dashboard, `C-x k` kills the shell.
-(define (k8s--open-shell pod ns)
-  (let ((sh (k8s--shell)))
-    (split-window-below)                     ; half-height pane across the bottom
-    (other-window)                           ; move focus into it
-    (make-terminal (string-append "*k8s-shell:" pod "*") *k8s-command*
+;; `s`: split the dashboard window in half and run an interactive shell inside the
+;; pod in the new bottom pane. Focus follows the `k8s-shell-focus` option (the
+;; terminal by default, so you can type). `S`: the same shell, full-window (it
+;; replaces the dashboard in this window; `C-x b` goes back).
+;;
+;; A terminal sends almost every key to the shell. What still reaches the editor:
+;; `C-x` (`C-x o` other pane, `C-x 1` only this pane, `C-x k` kill), your evil
+;; leader chords via the ALT leader (`M-SPC n o` = your `SPC n o`), and any chord
+;; in the `terminal-passthrough-keys` option. When the shell exits, its pane and
+;; buffer close on their own (see k8s--on-terminal-exit).
+(define k8s--shell-prefix "*k8s-shell:")
+(define (k8s--open-shell pod ns full)
+  (let ((sh (k8s--shell))
+        (stay (and (not full) (k8s--shell-focus-dashboard?))))
+    (when (not full)
+      (split-window-below)                   ; half-height pane across the bottom
+      (other-window))                        ; the terminal opens in the new pane
+    (make-terminal (string-append k8s--shell-prefix pod "*") *k8s-command*
                    (list "exec" "-it" pod "-n" ns "--" sh)
                    "")                       ; "" → the active buffer's directory
-    (message (string-append "shell → " pod " (" ns ") : " sh))))
+    (when stay (other-window))               ; back to the dashboard pane
+    (message (string-append "shell → " pod " (" ns ") : " sh
+                            (if stay "  ·  C-x o to enter it" "")))))
 (define-command (k8s-shell)
   (let ((r (k8s--resource-at)))
     (when (k8s--require-kind r "pod" "pod to open a shell")
-      (k8s--open-shell (nth r 2) (nth r 3)))))
+      (k8s--open-shell (nth r 2) (nth r 3) #f))))
+(define-command (k8s-shell-full)
+  (let ((r (k8s--resource-at)))
+    (when (k8s--require-kind r "pod" "pod to open a shell")
+      (k8s--open-shell (nth r 2) (nth r 3) #t))))
+
+;; terminal-exit-hook handler (called with the dead terminal's buffer name): close
+;; a pod shell's pane — unless it's the only window — and kill its buffer, so an
+;; `exit` leaves you back on the dashboard instead of in a dead split.
+(define (k8s--on-terminal-exit name)
+  (when (and (starts-with? name k8s--shell-prefix)
+             (not (k8s--shell-keep-on-exit?)))
+    (let ((w (get-buffer-window name)))
+      (when (and (>= w 0) (> (length (window-list)) 1))
+        (select-window w)
+        (delete-window)))
+    (kill-buffer-named name)))
+(add-hook "terminal-exit-hook" 'k8s--on-terminal-exit)
 
 ;; ── scale (deployments) ───────────────────────────────────────────────────────
 (define-command (k8s-scale)
@@ -520,7 +562,7 @@
 ;; `s` is context-sensitive: a shell on a pod, scale on a deployment.
 (define-command (k8s-shell-or-scale)
   (let ((r (k8s--resource-at)))
-    (cond ((and r (equal? (nth r 1) "pod"))        (k8s--open-shell (nth r 2) (nth r 3)))
+    (cond ((and r (equal? (nth r 1) "pod"))        (k8s--open-shell (nth r 2) (nth r 3) #f))
           ((and r (equal? (nth r 1) "deployment")) (k8s-scale))
           (else (message "k8s: 's' opens a shell on a pod or scales a deployment")))))
 (define (k8s--scale-to name ns input)
@@ -600,6 +642,7 @@
                     (list "l" "Logs"           'k8s-logs))
               (list "Act"
                     (list "s" "Shell"          'k8s-shell)
+                    (list "shift-s" "Shell (full window)" 'k8s-shell-full)
                     (list "x" "Delete"         'k8s-delete)
                     (list "q" "Close"          'transient-quit)))))
      ((and r (equal? (nth r 1) "deployment"))
@@ -669,6 +712,7 @@
 (define-key "k8s-mode" "l" 'k8s-logs)
 (define-key "k8s-mode" "y" 'k8s-yaml)
 (define-key "k8s-mode" "s" 'k8s-shell-or-scale)   ; pod → shell, deployment → scale
+(define-key "k8s-mode" "shift-s" 'k8s-shell-full)   ; S — pod shell, full window
 (define-key "k8s-mode" "x" 'k8s-delete)
 (define-key "k8s-mode" "shift-n" 'k8s-set-namespace)
 (define-key "k8s-mode" "shift-a" 'k8s-toggle-all-namespaces)
@@ -696,17 +740,28 @@
 ;; `helix-normal:<mode>` overlay BEFORE the buffer's own keymap. We register our
 ;; own so j/k (and friends) traverse the dashboard and scroll the detail/log
 ;; buffers, without depending on or mutating any core mode list. Inert under plain
-;; Emacs, where the overlays aren't consulted. (Arrow keys and n/p work anyway.)
+;; Emacs, where the overlays aren't consulted. (Arrow keys work anyway; under
+;; plain Emacs n/p move by line.)
 
-;; Status buffer: overlay only j/k (+ G / C-d / C-u) so the letter action keys
-;; (d/l/y/s/x/a/r/g) stay free — matching magit. No `g g` overlay: single `g`
-;; must remain refresh.
+;; Status buffer: motion + search only, so the letter action keys (d/l/y/s/x/a/r)
+;; stay free — matching magit's evil-collection. `g` becomes a prefix under
+;; evil/helix (`g g` top, `g r` refresh — evil-collection's convention); `r` still
+;; refreshes on one key. `n` repeats a `/` search here (Emacs keeps n/p = lines);
+;; `N` stays the namespace picker.
+;;
+;; Your own evil LEADER chords (`evil-leader-set` in init.scm) work in this buffer
+;; too — the editor consults its leader keymap for special buffers, after this
+;; overlay — so e.g. `SPC n o` runs `delete-other-windows` here.
 (define (k8s--bind-status-motion km)
   (define-key km "j" 'next-line)
   (define-key km "k" 'previous-line)
+  (define-key km "g g" 'evil-goto-first-line)
+  (define-key km "g r" 'k8s-refresh)
   (define-key km "shift-g" 'evil-goto-last-line)
   (define-key km "ctrl-d" 'evil-scroll-down)
-  (define-key km "ctrl-u" 'evil-scroll-up))
+  (define-key km "ctrl-u" 'evil-scroll-up)
+  (define-key km "/" 'evil-search-forward)
+  (define-key km "n" 'evil-search-next))
 (k8s--bind-status-motion "evil-normal:k8s-mode")
 (k8s--bind-status-motion "helix-normal:k8s-mode")
 
@@ -726,6 +781,10 @@
   (define-key km "g g" 'evil-goto-first-line)
   (define-key km "shift-g" 'evil-goto-last-line)
   (define-key km "ctrl-d" 'evil-scroll-down)
-  (define-key km "ctrl-u" 'evil-scroll-up))
+  (define-key km "ctrl-u" 'evil-scroll-up)
+  (define-key km "/" 'evil-search-forward)
+  (define-key km "?" 'evil-search-backward)
+  (define-key km "n" 'evil-search-next)
+  (define-key km "shift-n" 'evil-search-previous))
 (k8s--bind-readonly-motion "evil-normal:k8s-detail-mode")
 (k8s--bind-readonly-motion "helix-normal:k8s-detail-mode")
