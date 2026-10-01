@@ -242,6 +242,101 @@
          (k8s--lines (k8s--run (list "get" "nodes" "--no-headers"
                                      "-L" (string-join cands ",")))))))
 
+;; ── node packing (requests vs allocatable) ────────────────────────────────────
+;; How full each node is, as the scheduler sees it: CPU / memory REQUESTS as a
+;; percent of allocatable, plus pod count vs the allocatable pod limit. Parsed
+;; from `kubectl describe nodes` (its "Allocated resources" block already carries
+;; the percentages), so no JSON and no metrics-server needed.
+(define k8s--bar-width 10)
+;; Integer from a token like "(42%)" or "(9" — #f when it has no digits.
+(define (k8s--int-of s)
+  (let ((d (list->string (filter (lambda (c) (member c (string->list "0123456789")))
+                                 (string->list s)))))
+    (if (equal? d "") #f (string->number d))))
+;; node-name -> (cpu% mem% pods pods-max), any of which may be #f.
+(define (k8s--node-pack-map)
+  (let loop ((ls (k8s--lines (k8s--run (list "describe" "nodes"))))
+             (name #f) (cpu #f) (mem #f) (pods #f) (pmax #f) (acc '()))
+    (let ((flush (lambda () (if name (cons (cons name (list cpu mem pods pmax)) acc) acc))))
+      (if (null? ls)
+          (reverse (flush))
+          (let* ((f  (k8s--fields (car ls)))
+                 (f0 (k8s--nth-or f 0 ""))
+                 (f2 (k8s--nth-or f 2 "")))
+            (cond
+             ((equal? f0 "Name:")
+              (loop (cdr ls) (k8s--nth-or f 1 #f) #f #f #f #f (flush)))
+             ;; Allocated resources rows: `cpu  850m (42%)  100m (5%)` (no colon,
+             ;; unlike the Capacity/Allocatable `cpu: 4` rows).
+             ((and (equal? f0 "cpu") (string-contains? f2 "%"))
+              (loop (cdr ls) name (k8s--int-of f2) mem pods pmax acc))
+             ((and (equal? f0 "memory") (string-contains? f2 "%"))
+              (loop (cdr ls) name cpu (k8s--int-of f2) pods pmax acc))
+             ;; `Non-terminated Pods:  (9 in total)`
+             ((and (equal? f0 "Non-terminated") (equal? (k8s--nth-or f 1 "") "Pods:"))
+              (loop (cdr ls) name cpu mem (k8s--int-of f2) pmax acc))
+             ;; `pods: 110` — Allocatable follows Capacity, so the last one wins.
+             ((equal? f0 "pods:")
+              (loop (cdr ls) name cpu mem pods (k8s--int-of (k8s--nth-or f 1 "")) acc))
+             (else (loop (cdr ls) name cpu mem pods pmax acc))))))))
+
+(define (k8s--repeat s n) (if (<= n 0) "" (string-append s (k8s--repeat s (- n 1)))))
+(define (k8s--pad-right s n) (string-append s (k8s--repeat " " (- n (utf8-length s)))))
+(define (k8s--pad-left s n) (string-append (k8s--repeat " " (- n (utf8-length s))) s))
+;; Green with room to spare, yellow getting full, red (nearly) full.
+(define (k8s--pack-face pct)
+  (cond ((>= pct 90) "k8s-err") ((>= pct 70) "k8s-warn") (else "k8s-ok")))
+;; A meter cell, `██████░░░░  60%`, as (text accents); accents are (start end
+;; face) byte ranges relative to the cell, so the bar colors by its own fill
+;; regardless of the row's status face. `label` is the text after the bar
+;; ("60%", "19/110"), right-aligned in `label-w` columns.
+(define (k8s--meter pct label label-w)
+  (if (not pct)
+      (list (k8s--pad-right "-" (+ k8s--bar-width label-w)) '())
+      (let* ((n     (quotient (+ (* (max 0 (min 100 pct)) k8s--bar-width) 50) 100))
+             (fill  (k8s--repeat "█" n))
+             (empty (k8s--repeat "░" (- k8s--bar-width n)))
+             (num   (k8s--pad-left label label-w))
+             (face  (k8s--pack-face pct))
+             (a     (utf8-length fill))
+             (b     (+ a (utf8-length empty))))
+        (list (string-append fill empty num)
+              (list (list 0 a face) (list a b "k8s-dim")
+                    (list b (+ b (utf8-length num)) face))))))
+(define (k8s--pct-meter pct)
+  (k8s--meter pct (if pct (string-append (number->string pct) "%") "") 5))
+;; Pod slots: running pods vs the node's allocatable pod limit, e.g. `19/110`.
+(define k8s--pods-label-w 8)
+(define (k8s--pods-meter pods pmax)
+  (if (and pods pmax (> pmax 0))
+      (k8s--meter (quotient (* 100 pods) pmax)
+                  (string-append (number->string pods) "/" (number->string pmax))
+                  k8s--pods-label-w)
+      (k8s--meter #f "" k8s--pods-label-w)))
+(define (k8s--shift-accents accs off)
+  (map (lambda (x) (list (+ off (nth x 0)) (+ off (nth x 1)) (nth x 2))) accs))
+;; Column header for the packing cells appended to the nodes table.
+(define (k8s--pack-header)
+  (string-append "  " (k8s--pad-right "POD SLOTS" (+ k8s--bar-width k8s--pods-label-w))
+                 "   " (k8s--pad-right "CPU REQ" (+ k8s--bar-width 5))
+                 "   MEM REQ"))
+;; The packing cells for one node, as (text accents) relative to the suffix.
+(define (k8s--pack-suffix info)
+  (let* ((pods (k8s--pods-meter (and info (nth info 2)) (and info (nth info 3))))
+         (cpu  (k8s--pct-meter (and info (nth info 0))))
+         (mem  (k8s--pct-meter (and info (nth info 1))))
+         (o1   2)
+         (o2   (+ o1 (utf8-length (car pods)) 3))
+         (o3   (+ o2 (utf8-length (car cpu)) 3)))
+    (list (string-append "  " (car pods) "   " (car cpu) "   " (car mem))
+          (append (k8s--shift-accents (cadr pods) o1)
+                  (k8s--shift-accents (cadr cpu) o2)
+                  (k8s--shift-accents (cadr mem) o3)))))
+;; Apply a row's relative accents at absolute byte `base`.
+(define (k8s--accent-row base accs)
+  (for-each (lambda (x) (section-accent (+ base (nth x 0)) (+ base (nth x 1)) (nth x 2)))
+            accs))
+
 ;; ── rendering ─────────────────────────────────────────────────────────────────
 ;; Record which resource sits on a rendered line (with its namespace), so
 ;; d/l/y/s/x can resolve it and act in the right namespace.
@@ -277,8 +372,10 @@
 
 ;; Render `records` grouped under one outer foldable section `id`/`label`, a
 ;; nested foldable subsection per group. A record is (group display-row name ns
-;; face kind); each group heading takes its worst member's face, so a collapsed
-;; group still flags trouble. Shared by pods (by workload) and nodes (by pool).
+;; face kind [accents]) — optional accents are (start end face) byte ranges
+;; relative to display-row. Each group heading takes its worst member's face, so
+;; a collapsed group still flags trouble. Shared by pods (by workload) and nodes
+;; (by pool).
 (define (k8s--emit-groups id label header records)
   (let ((groups (k8s--uniq (map car records)))
         (idstr  (symbol->string id)))
@@ -298,6 +395,7 @@
                (for-each
                 (lambda (m)
                   (k8s--record (section-point-line) (nth m 5) (nth m 2) (nth m 3))
+                  (k8s--accent-row (+ (section-point-byte) 4) (k8s--nth-or m 6 '()))
                   (section-line (string-append "    " (nth m 1)) (nth m 4)))
                 members)
                (section-close (string-append idstr "/" g))))
@@ -328,35 +426,45 @@
 
 ;; Nodes. Adaptive: group by node pool when it yields 2+ groups, else stay flat
 ;; (single-pool / kind / minikube clusters just show a plain Nodes section).
+;; Each row gets packing meters appended (see k8s--node-pack-map); the kubectl
+;; rows are padded to a common width first so the meters line up.
 (define (k8s--emit-nodes)
   (let* ((all    (k8s--lines (k8s--run (list "get" "nodes" "-o" "wide"))))
-         (header (if (null? all) "" (car all)))
          (body   (if (null? all) '() (cdr all)))
+         (pmap   (k8s--node-pack-map))
+         (width  (let loop ((l all) (w 0))
+                    (if (null? l) w (loop (cdr l) (max w (utf8-length (car l)))))))
+         (pad    (lambda (s) (if (null? pmap) s (k8s--pad-right s width))))
+         (header (if (null? all) ""
+                     (string-append (pad (car all)) (if (null? pmap) "" (k8s--pack-header)))))
          (gmap   (k8s--node-group-map (k8s--node-group-candidates)))
          (recs   (map (lambda (row)
                         (let* ((f (k8s--fields row))
                                (name (if (null? f) "" (car f)))
                                (grp  (let ((g (alist-ref gmap name))) (if g g "(no pool)")))
-                               (face (k8s--node-face (k8s--nth-or f 1 ""))))
-                          (list grp row name "" face "node")))
+                               (face (k8s--node-face (k8s--nth-or f 1 "")))
+                               (sfx  (if (null? pmap) (list "" '())
+                                         (k8s--pack-suffix (alist-ref pmap name))))
+                               (prow (pad row)))
+                          (list grp (string-append prow (car sfx)) name "" face "node"
+                                (k8s--shift-accents (cadr sfx) (utf8-length prow)))))
                       body))
          (groups (k8s--uniq (map car recs))))
     (if (< (length groups) 2)
-        (k8s--emit-flat-nodes header body)
+        (k8s--emit-flat-nodes header recs)
         (k8s--emit-groups 'k8s-nodes "Nodes" header recs))))
-(define (k8s--emit-flat-nodes header body)
+(define (k8s--emit-flat-nodes header recs)
   (section-open 'k8s-nodes
-                (string-append "Nodes (" (number->string (length body)) ")") "k8s-section")
-  (if (null? body)
+                (string-append "Nodes (" (number->string (length recs)) ")") "k8s-section")
+  (if (null? recs)
       (section-line "    (none)" "k8s-dim")
       (begin
         (section-line (string-append "  " header) "k8s-dim")
-        (for-each (lambda (row)
-                    (let ((f (k8s--fields row)))
-                      (k8s--record (section-point-line) "node" (if (null? f) "" (car f)) "")
-                      (section-line (string-append "  " row)
-                                    (k8s--node-face (k8s--nth-or f 1 "")))))
-                  body)))
+        (for-each (lambda (m)
+                    (k8s--record (section-point-line) "node" (nth m 2) "")
+                    (k8s--accent-row (+ (section-point-byte) 2) (nth m 6))
+                    (section-line (string-append "  " (nth m 1)) (nth m 4)))
+                  recs)))
   (section-close 'k8s-nodes)
   (section-line "" #f))
 

@@ -106,6 +106,26 @@ YAML, which is why `y` on a pod never shows it. Point at an HPA row and `d` /
 row turns red when the HPA can't read its metrics (`<unknown>` targets — the
 `FailedGetResourceMetric` case).
 
+## Node packing
+
+Each node row ends with three meters showing how full the node is, as the
+scheduler sees it:
+
+```
+POD SLOTS            CPU REQ           MEM REQ
+██░░░░░░░░  19/110   █████████░  94%   █████░░░░░  47%
+```
+
+- **POD SLOTS**: non-terminated pods vs the node's allocatable pod limit.
+- **CPU REQ** / **MEM REQ**: summed container *requests* as a percent of
+  allocatable. Requests, not live usage, decide whether another pod fits.
+
+A bar is green below 70%, yellow from 70%, and red from 90%, separately from
+the row's Ready/NotReady color. The numbers come from the "Allocated resources"
+block of `kubectl describe nodes`, so you don't need a JSON parser or
+metrics-server. A node shows `-` when describe returns nothing for it, for
+example because RBAC doesn't allow it.
+
 ## Grouping
 
 **Pods** are grouped by their owning workload (Deployment / StatefulSet /
