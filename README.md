@@ -198,6 +198,18 @@ in another buffer — reading logs, a describe, anything — it refreshes the
 dashboard **silently in place** and never swaps focus back to it. Polling stops
 when the dashboard buffer is closed or you toggle it off.
 
+## Pod CPU and memory sparklines
+
+When the cluster runs [metrics-server](https://github.com/kubernetes-sigs/metrics-server), each pod row ends with CPU and memory sparklines and the latest reading:
+
+```
+web-7d9f-abcde   1/1   Running   …   ▃▆█▅▆▇          300m   ▇▇█▇▇▇          130Mi
+```
+
+Every refresh takes one `kubectl top pods` reading and keeps the last 16 per pod (`*k8s-spark-samples*`), so the lines fill in as you refresh. Turn on auto-refresh (`a`) to sample every 5 seconds. Each sparkline is scaled from zero to that pod's own recent peak.
+
+The sparklines need an editor with text charts (`plot.scm`). On older editors, or when `kubectl top` fails because metrics-server isn't installed, pod rows look exactly as before. A failed `kubectl top` is retried every 12 refreshes rather than on each one.
+
 ## Copying to the clipboard
 
 Vim/helix `y` yank does **not** work in these buffers — it's a constraint of how

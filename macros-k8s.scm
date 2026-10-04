@@ -33,6 +33,7 @@
 (define *k8s-command* "kubectl")     ; the kubectl executable
 (define *k8s-log-tail* 500)          ; lines fetched by the logs (l) command
 (define *k8s-auto-refresh-ms* 5000)  ; poll interval when auto-refresh is on
+(define *k8s-spark-samples* 16)      ; CPU/memory readings kept per pod (sparkline width)
 
 ;; The shell `s` runs inside a pod (via `kubectl exec -it`). Configured through
 ;; the editor's OPTION store, not a Scheme var — a plain `(define *k8s-shell* …)`
@@ -81,6 +82,9 @@
    'auto        #f    ; auto-refresh enabled?
    'timer-armed #f    ; is a poll timer currently scheduled?
    'confirm     #f    ; pending destructive-op closure (y-or-n-p)
+   'metrics     (hash) ; "ns/pod" -> recent (cpu-millicores mem-MiB) readings
+   'metrics-ok  #f    ; did the last `kubectl top pods` succeed?
+   'metrics-wait 0    ; renders to skip before retrying a failed `kubectl top`
    ))
 (define (k8s--st key) (hash-try-get k8s-state key))
 (define (k8s--st! key val) (set! k8s-state (hash-insert k8s-state key val)))
@@ -277,7 +281,8 @@
 
 ;; Render `records` grouped under one outer foldable section `id`/`label`, a
 ;; nested foldable subsection per group. A record is (group display-row name ns
-;; face kind); each group heading takes its worst member's face, so a collapsed
+;; face kind [segs]) — `segs`, optional, are (text face) pieces appended to the
+;; row (pod sparklines); each group heading takes its worst member's face, so a collapsed
 ;; group still flags trouble. Shared by pods (by workload) and nodes (by pool).
 (define (k8s--emit-groups id label header records)
   (let ((groups (k8s--uniq (map car records)))
@@ -298,21 +303,147 @@
                (for-each
                 (lambda (m)
                   (k8s--record (section-point-line) (nth m 5) (nth m 2) (nth m 3))
-                  (section-line (string-append "    " (nth m 1)) (nth m 4)))
+                  (k8s--line-with-segs (string-append "    " (nth m 1))
+                                       (if (> (length m) 6) (nth m 6) '())
+                                       (nth m 4)))
                 members)
                (section-close (string-append idstr "/" g))))
            groups)))
     (section-close id)
     (section-line "" #f)))
 
+;; ── pod metrics sparklines ──────────────────────────────────────────────────
+;; Each render samples `kubectl top pods` (needs metrics-server) and keeps the
+;; last *k8s-spark-samples* readings per pod; pod rows then end with CPU and
+;; memory sparklines drawn by the editor's plot.scm. Both are optional: with no
+;; metrics-server, or on an editor build without plot.scm, rows render as before.
+
+;; plot.scm's sparkline function, or #f on editors without it. Looked up through
+;; eval-string: naming it directly would make this whole file fail to load on
+;; older builds (Steel rejects a unit over one unknown identifier).
+(define k8s--sparkline
+  (if (member "plot-sparkline-string" (function-list))
+      (eval-string "plot-sparkline-string")
+      #f))
+
+;; A failed `kubectl top` (no metrics-server) is retried only every this many
+;; renders, so clusters without metrics don't pay for it on every refresh.
+(define k8s--metrics-retry 12)
+
+(define (k8s--strip-suffix s suf) (substring s 0 (- (string-length s) (string-length suf))))
+(define (k8s--num s) (let ((n (string->number s))) (if n (exact->inexact n) #f)))
+
+;; kubectl CPU quantity → millicores: "250m" → 250, "2" → 2000.
+(define (k8s--parse-cpu s)
+  (if (ends-with? s "m")
+      (k8s--num (k8s--strip-suffix s "m"))
+      (let ((n (k8s--num s))) (if n (* n 1000.0) #f))))
+
+;; kubectl memory quantity → MiB: "128Mi" → 128, "2Gi" → 2048, bare bytes too.
+(define (k8s--parse-mem s)
+  (let ((scaled (lambda (suf factor)
+                  (let ((n (k8s--num (k8s--strip-suffix s suf)))) (if n (* n factor) #f)))))
+    (cond ((ends-with? s "Ki") (scaled "Ki" (/ 1.0 1024)))
+          ((ends-with? s "Mi") (scaled "Mi" 1.0))
+          ((ends-with? s "Gi") (scaled "Gi" 1024.0))
+          ((ends-with? s "Ti") (scaled "Ti" 1048576.0))
+          (else (let ((n (k8s--num s))) (if n (/ n 1048576.0) #f))))))
+
+;; Take one `kubectl top pods` reading. History is rebuilt from the pods in this
+;; reading, so deleted pods drop out instead of accumulating.
+(define (k8s--sample-pod-metrics!)
+  (cond
+    ((not k8s--sparkline) #f)
+    ((> (k8s--st 'metrics-wait) 0)
+     (k8s--st! 'metrics-wait (- (k8s--st 'metrics-wait) 1)))
+    (else
+     (let ((res (k8s--run-full (append (list "top" "pods" "--no-headers")
+                                       (k8s--get-ns-args #t)))))
+       (if (not (equal? (car res) "0"))
+           (begin (k8s--st! 'metrics-ok #f)
+                  (k8s--st! 'metrics-wait k8s--metrics-retry))
+           (let ((off  (if (k8s--st 'all-ns) 1 0))
+                 (old  (k8s--st 'metrics))
+                 (hist (hash)))
+             (for-each
+              (lambda (row)
+                (let* ((f    (k8s--fields row))
+                       (name (k8s--nth-or f off ""))
+                       (ns   (if (= off 1) (k8s--nth-or f 0 "") (k8s--st 'namespace)))
+                       (key  (string-append ns "/" name))
+                       (cpu  (k8s--parse-cpu (k8s--nth-or f (+ off 1) "")))
+                       (mem  (k8s--parse-mem (k8s--nth-or f (+ off 2) "")))
+                       (prev (let ((h (hash-try-get old key))) (if h h '()))))
+                  (when (and cpu mem)
+                    (set! hist (hash-insert hist key
+                                            (k8s--last-n (append prev (list (list cpu mem)))
+                                                         *k8s-spark-samples*))))))
+              (k8s--lines (cadr res)))
+             (k8s--st! 'metrics hist)
+             (k8s--st! 'metrics-ok #t)))))))
+
+(define (k8s--fmt-cpu m)
+  (if (>= m 1000)
+      (number->string (/ (round (/ m 100)) 10))   ; cores, one decimal
+      (string-append (number->string (inexact->exact (round m))) "m")))
+(define (k8s--fmt-mem mib)
+  (if (>= mib 1024)
+      (string-append (number->string (/ (round (/ mib 102.4)) 10)) "Gi")
+      (string-append (number->string (inexact->exact (round mib))) "Mi")))
+
+;; A sparkline in a fixed width, starting under its column heading and growing
+;; rightward as readings arrive (newest reading last). Scaled from 0, so a pod's
+;; bars compare against its own recent peak.
+(define (k8s--spark values)
+  (pad-right (k8s--sparkline values 'min 0) *k8s-spark-samples*))
+
+;; The CPU/memory columns appended to a pod row, as (text face) segments; '()
+;; when there is nothing to draw.
+(define (k8s--pod-metric-segs key)
+  (let ((samples (hash-try-get (k8s--st 'metrics) key)))
+    (if (or (not (k8s--st 'metrics-ok)) (not samples) (null? samples))
+        '()
+        (let ((cpus (map car samples)) (mems (map cadr samples)))
+          (list (list "  " #f)
+                (list (k8s--spark cpus) "plot-series-0")
+                (list (string-append " " (pad-right (k8s--fmt-cpu (last cpus)) 6) " ") "k8s-dim")
+                (list (k8s--spark mems) "plot-series-1")
+                (list (string-append " " (k8s--fmt-mem (last mems))) "k8s-dim"))))))
+
+;; Header text matching k8s--pod-metric-segs' columns.
+(define (k8s--pod-metric-header)
+  (string-append "  " (pad-right "CPU" (+ *k8s-spark-samples* 8)) "MEMORY"))
+
+;; Emit `text` plus (text face) `segs` as one section line with whole-line face
+;; `face`; each segment that has a face becomes a byte-range accent over it.
+(define (k8s--line-with-segs text segs face)
+  (let ((b (section-point-byte)))
+    (let loop ((segs segs) (at (utf8-length text)) (acc text) (accents '()))
+      (if (null? segs)
+          (begin
+            (section-line acc face)
+            (for-each (lambda (a) (section-accent (+ b (car a)) (+ b (cadr a)) (nth a 2)))
+                      accents))
+          (let* ((seg (car segs)) (n (utf8-length (car seg))))
+            (loop (cdr segs) (+ at n) (string-append acc (car seg))
+                  (if (cadr seg) (cons (list at (+ at n) (cadr seg)) accents) accents)))))))
+
 ;; Pods, grouped by owning workload. The `-o wide` rows give the display columns
 ;; (rich STATUS, restarts, node); a second custom-columns query resolves each
 ;; pod's group. Fold a group to hide its pods, fold "Pods" to hide everything.
 (define (k8s--emit-pods)
+  (k8s--sample-pod-metrics!)
   (let* ((off  (if (k8s--st 'all-ns) 1 0))
          (all  (k8s--lines (k8s--run (append (list "get" "pods" "-o" "wide")
                                              (k8s--get-ns-args #t)))))
-         (header (if (null? all) "" (car all)))
+         ;; With metrics, pad rows to one width so the appended columns line up
+         ;; (kubectl doesn't pad its last column).
+         (metrics? (and (k8s--st 'metrics-ok) (not (null? all))))
+         (width  (if metrics? (apply max (map string-length all)) 0))
+         (all    (if metrics? (map (lambda (r) (pad-right r width)) all) all))
+         (header (cond ((null? all) "")
+                       (metrics? (string-append (car all) (k8s--pod-metric-header)))
+                       (else (car all))))
          (body   (if (null? all) '() (cdr all)))
          (gmap (k8s--pod-group-map))
          (recs (map (lambda (row)
@@ -322,7 +453,7 @@
                              (key  (string-append ns "/" name))
                              (grp  (let ((g (alist-ref gmap key))) (if g g "(no controller)")))
                              (face (k8s--phase-face (k8s--nth-or f (+ 2 off) ""))))
-                        (list grp row name ns face "pod")))
+                        (list grp row name ns face "pod" (k8s--pod-metric-segs key))))
                     body)))
     (k8s--emit-groups 'k8s-pods "Pods" header recs)))
 
