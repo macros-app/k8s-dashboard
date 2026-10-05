@@ -34,6 +34,7 @@
 (define *k8s-log-tail* 500)          ; lines fetched by the logs (l) command
 (define *k8s-auto-refresh-ms* 5000)  ; poll interval when auto-refresh is on
 (define *k8s-spark-samples* 16)      ; CPU/memory readings kept per pod (sparkline width)
+(define *k8s-chart-columns* 60)      ; time buckets across the metrics heatmap
 
 ;; The shell `s` runs inside a pod (via `kubectl exec -it`). Configured through
 ;; the editor's OPTION store, not a Scheme var — a plain `(define *k8s-shell* …)`
@@ -56,6 +57,20 @@
 (define (k8s--shell-keep-on-exit?)
   (let ((v (get-option "k8s-shell-keep-on-exit")))
     (or (eq? v #t) (equal? v "true"))))
+;; Metrics history (the `M` charts). A background sampler takes a `kubectl top
+;; nodes` reading every k8s-metrics-interval seconds while the dashboard or the
+;; metrics buffer is open, stores it per context on disk, and drops readings
+;; older than k8s-metrics-retention-hours, so the charts fill in over a day and
+;; stay bounded:
+;;   (set-option "k8s-metrics-interval" 30)          ; default 60
+;;   (set-option "k8s-metrics-retention-hours" 72)   ; default 24
+(define (k8s--opt-number key default)
+  (let ((v (get-option key)))
+    (cond ((and (number? v) (> v 0)) v)
+          ((and (string? v) (string->number v) (> (string->number v) 0)) (string->number v))
+          (else default))))
+(define (k8s--metrics-interval) (k8s--opt-number "k8s-metrics-interval" 60))
+(define (k8s--retention-secs) (* 3600 (k8s--opt-number "k8s-metrics-retention-hours" 24)))
 ;; Node label to group Nodes by, via the option store (read by k8s--node-group-label):
 ;;   (set-option "k8s-node-group-label" "topology.kubernetes.io/zone")
 ;; Unset / "" = auto-detect the cloud node-pool label (EKS / GKE / Karpenter /
@@ -85,6 +100,14 @@
    'metrics     (hash) ; "ns/pod" -> recent (cpu-millicores mem-MiB) readings
    'metrics-ok  #f    ; did the last `kubectl top pods` succeed?
    'metrics-wait 0    ; renders to skip before retrying a failed `kubectl top`
+   'store       '()   ; node readings, oldest first: (epoch node cpu-m cpu% mem-MiB mem%)
+   'store-ctx   #f    ; the context `store` belongs to (loaded from its file)
+   'sampler-armed #f  ; is the background metrics sampler scheduled?
+   'metrics-at  #f    ; when the last successful `kubectl top pods` reading was taken
+   'wl-store    '()   ; workload readings, oldest first: (epoch ns group cpu-sum mem-sum pods)
+   'wl-store-ctx #f   ; the context `wl-store` belongs to
+   'wl-recorded-at #f ; the pod reading last folded into `wl-store`
+   'built       #f    ; buffer whose sections lib-section holds (it keeps one set)
    ))
 (define (k8s--st key) (hash-try-get k8s-state key))
 (define (k8s--st! key val) (set! k8s-state (hash-insert k8s-state key val)))
@@ -380,15 +403,20 @@
                                                          *k8s-spark-samples*))))))
               (k8s--lines (cadr res)))
              (k8s--st! 'metrics hist)
-             (k8s--st! 'metrics-ok #t)))))))
+             (k8s--st! 'metrics-ok #t)
+             (k8s--st! 'metrics-at (string->number (current-time "%s")))))))))
 
+;; `x` to one decimal place via integer arithmetic ("1.2", never "1.2000000000000002").
+(define (k8s--one-decimal x)
+  (let ((n (inexact->exact (round (* x 10)))))
+    (string-append (number->string (quotient n 10)) "." (number->string (abs (remainder n 10))))))
 (define (k8s--fmt-cpu m)
   (if (>= m 1000)
-      (number->string (/ (round (/ m 100)) 10))   ; cores, one decimal
+      (k8s--one-decimal (/ m 1000))               ; cores, one decimal
       (string-append (number->string (inexact->exact (round m))) "m")))
 (define (k8s--fmt-mem mib)
   (if (>= mib 1024)
-      (string-append (number->string (/ (round (/ mib 102.4)) 10)) "Gi")
+      (string-append (k8s--one-decimal (/ mib 1024)) "Gi")
       (string-append (number->string (inexact->exact (round mib))) "Mi")))
 
 ;; A sparkline in a fixed width, starting under its column heading and growing
@@ -427,6 +455,505 @@
           (let* ((seg (car segs)) (n (utf8-length (car seg))))
             (loop (cdr segs) (+ at n) (string-append acc (car seg))
                   (if (cadr seg) (cons (list at (+ at n) (cadr seg)) accents) accents)))))))
+
+;; ── metrics dashboard (M / M-x k8s-metrics) ─────────────────────────────────
+;; A second buffer of charts: cluster CPU and memory over time, node utilization
+;; (now, and as a heatmap over time), the heaviest pods, the pod memory
+;; distribution, and pod health. The charts over time read a stored history of
+;; `kubectl top nodes` readings (see k8s--sample-tick), kept per context on disk
+;; for k8s-metrics-retention-hours. Needs the editor's plot.scm (looked up by
+;; name, like k8s--sparkline) and metrics-server for the usage charts; pod health
+;; works without either.
+
+;; One of plot.scm's functions by name, or #f on editors without it.
+(define (k8s--plot-fn name)
+  (if (member name (function-list)) (eval-string name) #f))
+
+(define (k8s--now) (string->number (current-time "%s")))
+
+;; ── stored node history ──
+;; Records are (epoch node cpu-millicores cpu% mem-MiB mem%). One file per
+;; context under the editor's persistence directory (~/.config/macros on builds
+;; without it), one tab-separated record per line.
+(define (k8s--store-dir)
+  (string-append (if (member "persistence-directory" (function-list))
+                     (eval-string "(persistence-directory)")
+                     (string-append (getenv "HOME") "/.config/macros"))
+                 "/k8s-metrics"))
+;; A context name as a file name: letters, digits, `-` and `.` kept, rest `_`.
+(define k8s--slug-chars
+  (string->list "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-."))
+(define (k8s--slug s)
+  (list->string (map (lambda (c) (if (member c k8s--slug-chars) c #\_)) (string->list s))))
+(define (k8s--store-file ctx)
+  (string-append (k8s--store-dir) "/" (k8s--slug (if (equal? ctx "") "none" ctx)) ".tsv"))
+
+(define (k8s--record->line r)
+  (string-join (cons (number->string (car r))
+                     (cons (cadr r) (map number->string (cddr r))))
+               "\t"))
+(define (k8s--line->record line)
+  (let ((f (split-many line "\t")))
+    (and (= (length f) 6)
+         (let ((nums (map string->number (cons (car f) (cddr f)))))
+           (and (not (member #f nums))
+                (list (car nums) (cadr f) (nth nums 1) (nth nums 2) (nth nums 3) (nth nums 4)))))))
+
+;; Drop readings older than the retention window.
+(define (k8s--prune records now)
+  (let ((cutoff (- now (k8s--retention-secs))))
+    (filter (lambda (r) (>= (car r) cutoff)) records)))
+
+;; Make `store` hold the current context's history (loading it from disk on
+;; first use and after a context switch).
+(define (k8s--store-sync!)
+  (let ((ctx (k8s--st 'context)))
+    (when (not (equal? ctx (k8s--st 'store-ctx)))
+      (let* ((file (k8s--store-file ctx))
+             (recs (if (file-exists? file)
+                       (filter (lambda (r) r) (map k8s--line->record (k8s--lines (read-file file))))
+                       '())))
+        (k8s--st! 'store (k8s--prune recs (k8s--now)))
+        (k8s--st! 'store-ctx ctx)))))
+
+(define (k8s--store-save!)
+  (write-file (k8s--store-file (k8s--st 'store-ctx))
+              (string-append (string-join (map k8s--record->line (k8s--st 'store)) "\n") "\n")))
+
+;; "45%" → 45.0 (kubectl top nodes' percentage columns), #f if not a number.
+(define (k8s--parse-pct s)
+  (k8s--num (if (ends-with? s "%") (k8s--strip-suffix s "%") s)))
+
+;; One `kubectl top nodes` reading (NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%),
+;; appended to the stored history, pruned, and saved. #f when it fails.
+(define (k8s--sample-node-metrics!)
+  (k8s--store-sync!)
+  (let ((res (k8s--run-full (list "top" "nodes" "--no-headers"))))
+    (and (equal? (car res) "0")
+         (let* ((now (k8s--now))
+                (fresh (filter (lambda (r) r)
+                               (map (lambda (row)
+                                      (let* ((f (k8s--fields row))
+                                             (cpu (k8s--parse-cpu (k8s--nth-or f 1 "")))
+                                             (cpu% (k8s--parse-pct (k8s--nth-or f 2 "")))
+                                             (mem (k8s--parse-mem (k8s--nth-or f 3 "")))
+                                             (mem% (k8s--parse-pct (k8s--nth-or f 4 ""))))
+                                        (and cpu cpu% mem mem%
+                                             (list now (k8s--nth-or f 0 "") cpu cpu% mem mem%))))
+                                    (k8s--lines (cadr res))))))
+           (when (not (null? fresh))
+             (k8s--st! 'store (k8s--prune (append (k8s--st 'store) fresh) now))
+             (k8s--store-save!))
+           #t))))
+
+;; The stored readings grouped by sample time: ((epoch records…) …), oldest first.
+(define (k8s--by-epoch records)
+  (let loop ((rs records) (cur #f) (acc '()) (out '()))
+    (cond ((null? rs) (reverse (if cur (cons (cons cur (reverse acc)) out) out)))
+          ((equal? (car (car rs)) cur) (loop (cdr rs) cur (cons (car rs) acc) out))
+          (else (loop (cdr rs) (car (car rs)) (list (car rs))
+                      (if cur (cons (cons cur (reverse acc)) out) out))))))
+
+;; "2h 05m" / "14m" / "40s" for a span in seconds.
+(define (k8s--fmt-span secs)
+  (let* ((s (inexact->exact (round secs))) (h (quotient s 3600)) (m (quotient (remainder s 3600) 60)))
+    (cond ((>= h 1) (string-append (number->string h) "h " (if (< m 10) "0" "") (number->string m) "m"))
+          ((>= m 1) (string-append (number->string m) "m"))
+          (else (string-append (number->string s) "s")))))
+
+;; ── stored workload history ──
+;; Pods come and go; their workloads (Deployment, StatefulSet, DaemonSet, Job…)
+;; persist, so pod usage is stored per workload: at each sampler reading, the CPU
+;; and memory summed over the workload's pods and the pod count (average per pod
+;; = sum / count). Records are (epoch ns group cpu-sum mem-sum pods), in
+;; <context>.workloads.tsv beside the node history, pruned the same way.
+(define (k8s--wl-file ctx)
+  (string-append (k8s--store-dir) "/" (k8s--slug (if (equal? ctx "") "none" ctx)) ".workloads.tsv"))
+
+(define (k8s--wl->line r)
+  (string-join (list (number->string (car r)) (cadr r) (nth r 2)
+                     (number->string (nth r 3)) (number->string (nth r 4)) (number->string (nth r 5)))
+               "\t"))
+(define (k8s--line->wl line)
+  (let ((f (split-many line "\t")))
+    (and (= (length f) 6)
+         (let ((t (string->number (car f))) (c (string->number (nth f 3)))
+               (m (string->number (nth f 4))) (n (string->number (nth f 5))))
+           (and t c m n (> n 0) (list t (cadr f) (nth f 2) c m n))))))
+
+(define (k8s--wl-sync!)
+  (let ((ctx (k8s--st 'context)))
+    (when (not (equal? ctx (k8s--st 'wl-store-ctx)))
+      (let* ((file (k8s--wl-file ctx))
+             (recs (if (file-exists? file)
+                       (filter (lambda (r) r) (map k8s--line->wl (k8s--lines (read-file file))))
+                       '())))
+        (k8s--st! 'wl-store (k8s--prune recs (k8s--now)))
+        (k8s--st! 'wl-store-ctx ctx)
+        (k8s--st! 'wl-recorded-at #f)))))
+
+;; Fold the latest pod reading into per-workload records, once per reading.
+(define (k8s--record-workloads!)
+  (k8s--wl-sync!)
+  (let ((at (k8s--st 'metrics-at)))
+    (when (and (k8s--st 'metrics-ok) at (not (equal? at (k8s--st 'wl-recorded-at))))
+      (let* ((gmap (k8s--pod-group-map))
+             (sums (let loop ((ps (k8s--pods-now)) (h (hash)))
+                     (if (null? ps)
+                         h
+                         (let* ((p (car ps))
+                                (key (car p))
+                                (ns (car (k8s--split-once key "/")))
+                                (grp (let ((g (alist-ref gmap key))) (if g g "(no controller)")))
+                                (k (string-append ns "\t" grp))
+                                (cur (let ((c (hash-try-get h k))) (if c c (list 0.0 0.0 0)))))
+                           (loop (cdr ps)
+                                 (hash-insert h k (list (+ (car cur) (cadr p)) (+ (cadr cur) (nth p 2))
+                                                        (+ (nth cur 2) 1))))))))
+             (fresh (map (lambda (k)
+                           (let ((parts (split-many k "\t")) (v (hash-try-get sums k)))
+                             (list at (car parts) (cadr parts) (car v) (cadr v) (nth v 2))))
+                         (hash-keys->list sums))))
+        (k8s--st! 'wl-recorded-at at)
+        (when (not (null? fresh))
+          (k8s--st! 'wl-store (k8s--prune (append (k8s--st 'wl-store) fresh) (k8s--now)))
+          (write-file (k8s--wl-file (k8s--st 'wl-store-ctx))
+                      (string-append (string-join (map k8s--wl->line (k8s--st 'wl-store)) "\n") "\n")))))))
+
+;; Workload records in the selected scope, labeled "group" (or "ns/group"
+;; across all namespaces): an alist label -> records, oldest first.
+(define (k8s--wl-in-scope)
+  (let* ((all (k8s--st 'all-ns))
+         (ns (k8s--st 'namespace))
+         (recs (filter (lambda (r) (or all (equal? (cadr r) ns))) (k8s--st 'wl-store)))
+         (label (lambda (r) (if all (string-append (cadr r) "/" (nth r 2)) (nth r 2)))))
+    (map (lambda (l) (cons l (filter (lambda (r) (equal? (label r) l)) recs)))
+         (k8s--uniq (map label recs)))))
+
+;; Per-pod average CPU (millicores) / memory (MiB) of one workload record.
+(define (k8s--wl-avg-cpu r) (/ (nth r 3) (nth r 5)))
+(define (k8s--wl-avg-mem r) (/ (nth r 4) (nth r 5)))
+
+;; `values` of timestamped records bucketed into `cols` equal slices of [t0, now]
+;; (mean per bucket; #f where empty) — the shape a sparkline or heat row wants.
+(define (k8s--bucket recs t0 now cols f)
+  (let* ((span (max 1 (- now t0)))
+         (acc (let loop ((rs recs) (h (hash)))
+                (if (null? rs)
+                    h
+                    (let* ((r (car rs))
+                           (b (min (- cols 1) (max 0 (inexact->exact (floor (* cols (/ (- (car r) t0) span)))))))
+                           (cur (let ((c (hash-try-get h b))) (if c c (list 0.0 0)))))
+                      (loop (cdr rs) (hash-insert h b (list (+ (car cur) (f r)) (+ (cadr cur) 1)))))))))
+    (map (lambda (b) (let ((c (hash-try-get acc b))) (if c (/ (car c) (cadr c)) #f)))
+         (range 0 cols))))
+
+;; Workloads table: per workload, CPU and memory sparklines over the stored
+;; window (average per pod), the latest averages, and the pod count.
+(define (k8s--emit-workload-table groups t0 now)
+  (let* ((cols 30)
+         (w (apply max (cons 8 (map (lambda (g) (string-length (car g))) groups))))
+         ;; Between readings the last value holds; before the first, blank.
+         (spark (lambda (vals)
+                  (let loop ((vs vals) (prev #f) (lead 0) (acc '()))
+                    (cond ((null? vs)
+                           (pad-right (string-append (make-string lead #\space)
+                                                     (if (null? acc) "" (k8s--sparkline (reverse acc) 'min 0)))
+                                      cols))
+                          ((car vs) (loop (cdr vs) (car vs) lead (cons (car vs) acc)))
+                          (prev (loop (cdr vs) prev lead (cons prev acc)))
+                          (else (loop (cdr vs) prev (+ lead 1) acc)))))))
+    (section-line (string-append "  " (pad-right "WORKLOAD" w) "  "
+                                 (pad-right "CPU / pod" (+ cols 8)) (pad-right "MEMORY / pod" (+ cols 9)) "PODS")
+                  "k8s-dim")
+    (for-each
+     (lambda (g)
+       (let* ((recs (cdr g)) (now-r (last recs)))
+         (k8s--line-with-segs
+          (string-append "  " (pad-right (car g) w))
+          (list (list "  " #f)
+                (list (spark (k8s--bucket recs t0 now cols k8s--wl-avg-cpu)) "plot-series-0")
+                (list (string-append " " (pad-right (k8s--fmt-cpu (k8s--wl-avg-cpu now-r)) 6) " ") "k8s-dim")
+                (list (spark (k8s--bucket recs t0 now cols k8s--wl-avg-mem)) "plot-series-1")
+                (list (string-append " " (pad-right (k8s--fmt-mem (k8s--wl-avg-mem now-r)) 7) " ") "k8s-dim")
+                (list (number->string (nth now-r 5)) #f))
+          #f)))
+     groups)))
+
+;; ── background sampler ──
+;; Self-rearming timer: one node reading (stored) and one pod reading (for the
+;; pod charts and the dashboard sparklines) per k8s-metrics-interval, while the
+;; dashboard or metrics buffer is open. Redraws the metrics buffer after each.
+(define (k8s--sampler-arm!)
+  (when (not (k8s--st 'sampler-armed))
+    (k8s--st! 'sampler-armed #t)
+    (run-with-timer (* 1000 (k8s--metrics-interval)) "k8s--sample-tick")))
+(define-command (k8s--sample-tick)
+  (k8s--st! 'sampler-armed #f)
+  (let ((metrics? (member "*k8s-metrics*" (buffer-names)))
+        (dash? (member "*k8s-dashboard*" (buffer-names))))
+    (when (or metrics? dash?)
+      (k8s--resolve-context!)
+      (k8s--sample-node-metrics!)
+      (k8s--sample-pod-metrics!)
+      (k8s--record-workloads!)
+      (when metrics?
+        (k8s--render-metrics (not (equal? (current-buffer) "*k8s-metrics*")) #f))
+      (k8s--sampler-arm!))))
+
+;; ── charts ──
+;; Pod name as shown in charts: "ns/pod" across all namespaces, else just "pod".
+(define (k8s--chart-pod-name key)
+  (if (k8s--st 'all-ns) key (cadr (k8s--split-once key "/"))))
+(define (k8s--split-once s sep)
+  (let ((parts (split-many s sep)))
+    (list (car parts) (string-join (cdr parts) sep))))
+
+;; Newest (key cpu mem) per pod from the sampled history.
+(define (k8s--pods-now)
+  (let ((hist (k8s--st 'metrics)))
+    (map (lambda (k) (let ((s (last (hash-try-get hist k)))) (list k (car s) (cadr s))))
+         (hash-keys->list hist))))
+
+;; The `n` heaviest pods by the reading at index `i` (1 = CPU, 2 = memory).
+(define (k8s--top-pods n i)
+  (k8s--take (sort (k8s--pods-now) (lambda (a b) (> (nth a i) (nth b i)))) n))
+
+;; Emit a plot (from plot.scm) under a foldable heading, or a dim note.
+(define (k8s--chart-section id title note plot)
+  (section-open id title "k8s-section")
+  (if plot
+      ((k8s--plot-fn "plot-section-emit") plot)
+      (section-line (string-append "    " note) "k8s-dim"))
+  (section-close id)
+  (section-line "" #f))
+
+;; Pad labels to one width (plot-bars pads only within one call).
+(define (k8s--pad-labels items)
+  (let ((w (apply max (cons 0 (map (lambda (it) (string-length (car it))) items)))))
+    (map (lambda (it) (cons (pad-right (car it) w) (cdr it))) items)))
+
+;; A cluster total over time as (x y) points: x in minutes (or hours, for spans
+;; over 3h) before now, so the axis reads "-120 … 0". Returns (points unit).
+(define (k8s--series epochs now f)
+  (let* ((span (if (null? epochs) 0 (- now (car (car epochs)))))
+         (hours? (> span 10800))
+         (scale (if hours? 3600.0 60.0)))
+    (list (map (lambda (e) (list (/ (- (car e) now) scale) (f (cdr e)))) epochs)
+          (if hours? "hours" "minutes"))))
+
+;; Node CPU % as a heat matrix: the stored window split into *k8s-chart-columns*
+;; equal time buckets, each the node's mean CPU % (blank where it has none).
+;; One pass accumulating (sum count) per "node|bucket", so a day of readings
+;; stays cheap to draw.
+(define (k8s--node-heat records now)
+  (let* ((names (sort (k8s--uniq (map cadr records)) string<?))
+         (t0 (apply min (cons now (map car records))))
+         (span (max 1 (- now t0)))
+         (cols *k8s-chart-columns*)
+         (key (lambda (name b) (string-append name "|" (number->string b))))
+         (acc (let loop ((rs records) (h (hash)))
+                (if (null? rs)
+                    h
+                    (let* ((r (car rs))
+                           (b (min (- cols 1) (inexact->exact (floor (* cols (/ (- (car r) t0) span))))))
+                           (k (key (cadr r) b))
+                           (cur (let ((c (hash-try-get h k))) (if c c (list 0.0 0)))))
+                      (loop (cdr rs) (hash-insert h k (list (+ (car cur) (nth r 3)) (+ (cadr cur) 1)))))))))
+    (list names
+          (map (lambda (name)
+                 (map (lambda (b)
+                        (let ((c (hash-try-get acc (key name b))))
+                          (if c (/ (car c) (cadr c)) #f)))
+                      (range 0 cols)))
+               names))))
+
+;; Pod health: counts per STATUS, each bar in its status color, plus the top
+;; restarters. Built from `kubectl get pods`, so it works without metrics-server.
+(define (k8s--emit-pod-health bars empty-note)
+  (let* ((off  (if (k8s--st 'all-ns) 1 0))
+         (rows (map k8s--fields
+                    (k8s--lines (k8s--run (append (list "get" "pods" "--no-headers")
+                                                  (k8s--get-ns-args #t))))))
+         (statuses (map (lambda (f) (k8s--nth-or f (+ off 2) "?")) rows))
+         (counts (map (lambda (st) (list st (length (filter (lambda (x) (equal? x st)) statuses))))
+                      (k8s--uniq statuses)))
+         (counts (sort counts (lambda (a b) (> (cadr a) (cadr b)))))
+         (restarts (filter (lambda (r) (> (cadr r) 0))
+                           (map (lambda (f)
+                                  (list (let ((name (k8s--nth-or f off "")))
+                                          (if (= off 1) (string-append (car f) "/" name) name))
+                                        (let ((n (k8s--num (k8s--nth-or f (+ off 3) "0"))))
+                                          (if n n 0))))
+                                rows)))
+         (restarts (k8s--take (sort restarts (lambda (a b) (> (cadr a) (cadr b)))) 5)))
+    (section-open 'k8s-m-health (string-append "Pod health (" (number->string (length rows)) " pods)")
+                  "k8s-section")
+    (if (null? counts)
+        (section-line (string-append "    " empty-note) "k8s-dim")
+        (let ((mx (apply max (map cadr counts)))
+              (emit (k8s--plot-fn "plot-section-emit")))
+          ;; One plot-bars call per status so each bar takes its status color.
+          (for-each (lambda (it)
+                      (emit (bars (list it) 'width 30 'max mx
+                                  'face (k8s--phase-face (string-trim (car it))))))
+                    (k8s--pad-labels counts))
+          (when (not (null? restarts))
+            (section-line "" #f)
+            (section-line "    Most restarts" "k8s-dim")
+            (emit (bars restarts 'width 30 'face "k8s-warn")))))
+    (section-close 'k8s-m-health)
+    (section-line "" #f)))
+
+;; Build the metrics buffer. `sample?` takes fresh node and pod readings first
+;; (an explicit `r`); the background sampler passes #f after sampling itself.
+(define (k8s--render-metrics quiet sample?)
+  (let ((lines (k8s--plot-fn "plot-lines"))
+        (bars  (k8s--plot-fn "plot-bars"))
+        (heat  (k8s--plot-fn "plot-heatmap"))
+        (histo (k8s--plot-fn "plot-histogram")))
+    (if (not (and lines bars heat histo))
+        (message "k8s-metrics needs an editor with plot.scm (text charts)")
+        (begin
+          (k8s--resolve-context!)
+          (k8s--store-sync!)
+          (when sample?
+            (k8s--sample-node-metrics!)
+            (k8s--sample-pod-metrics!))
+          (k8s--record-workloads!)
+          (k8s--sampler-arm!)
+          (let* ((now (k8s--now))
+                 (store (k8s--prune (k8s--st 'store) now))
+                 (epochs (k8s--by-epoch store))
+                 (latest (if (null? epochs) '() (cdr (last epochs))))
+                 (span (if (null? epochs) 0 (- now (car (car epochs)))))
+                 (ns-label (if (k8s--st 'all-ns) "<all>" (k8s--st 'namespace)))
+                 (ok (k8s--st 'metrics-ok))
+                 (no-pods (if (k8s--st 'all-ns)
+                              "(no pods)"
+                              (string-append "(no pods in namespace " ns-label
+                                             " · A for all namespaces)")))
+                 (pod-why (if ok no-pods "(needs metrics-server: `kubectl top pods` failed)"))
+                 (node-why (cond ((null? epochs)
+                                  "(no `kubectl top nodes` readings yet: needs metrics-server)")
+                                 ((< (length epochs) 2)
+                                  (string-append "(collecting: one reading every "
+                                                 (number->string (k8s--metrics-interval)) "s)"))
+                                 (else #f))))
+            (section-begin)
+            (section-line
+             (string-append "Metrics · Context: " (let ((c (k8s--st 'context))) (if (equal? c "") "(none)" c))
+                            "    Pods: " ns-label)
+             "k8s-header")
+            (section-line
+             (string-append "  " (number->string (length epochs)) " readings over "
+                            (k8s--fmt-span span) " · one every " (number->string (k8s--metrics-interval))
+                            "s · kept " (k8s--fmt-span (k8s--retention-secs)))
+             "k8s-dim")
+            (section-line "  r sample now · A all namespaces · TAB fold · D dashboard · q quit" "k8s-dim")
+            (section-line "" #f)
+            ;; 1. Cluster usage over time: the sum over nodes at each reading.
+            ;;    The y axis fits the data, so a trend isn't flattened against 0.
+            (let ((cpu (k8s--series epochs now (lambda (rs) (/ (apply + (map (lambda (r) (nth r 2)) rs)) 1000.0))))
+                  (mem (k8s--series epochs now (lambda (rs) (/ (apply + (map (lambda (r) (nth r 4)) rs)) 1024.0)))))
+              (k8s--chart-section 'k8s-m-cpu
+                (string-append "Cluster CPU (cores) · x: " (cadr cpu) " ago") node-why
+                (and (not node-why) (lines (list (list "cpu" (car cpu))) 'width 60 'height 6 'x-max 0)))
+              (k8s--chart-section 'k8s-m-mem
+                (string-append "Cluster memory (GiB) · x: " (cadr mem) " ago") node-why
+                (and (not node-why) (lines (list (list "mem" (car mem))) 'width 60 'height 6 'x-max 0))))
+            ;; 2. Node utilization at the latest reading.
+            (k8s--chart-section 'k8s-m-nodes "Node utilization (%) now · CPU, memory"
+              "(no `kubectl top nodes` readings yet)"
+              (and (not (null? latest))
+                   (append
+                    (bars (k8s--pad-labels (map (lambda (r) (list (string-append (cadr r) " cpu") (nth r 3))) latest))
+                          'width 40 'max 100 'face "plot-series-0")
+                    (bars (k8s--pad-labels (map (lambda (r) (list (string-append (cadr r) " mem") (nth r 5))) latest))
+                          'width 40 'max 100 'face "plot-series-1"))))
+            ;; 3. Node CPU over the stored window, bucketed into fixed columns.
+            (let ((hm (if node-why #f (k8s--node-heat store now))))
+              (k8s--chart-section 'k8s-m-heat
+                (string-append "Node CPU (%) · last " (k8s--fmt-span span) ", oldest left") node-why
+                (and hm (heat (cadr hm) 'row-labels (car hm) 'min 0 'max 100 'cell-width 1))))
+            ;; Workloads (pod groups) over time: average per pod, the 5 heaviest
+            ;; as line series, then every workload as a sparkline row.
+            (let* ((groups (k8s--wl-in-scope))
+                   (wl-epochs (k8s--uniq (map car (apply append (map cdr groups)))))
+                   (wl-why (cond ((not ok) pod-why)
+                                 ((null? groups) no-pods)
+                                 ((< (length wl-epochs) 2)
+                                  (string-append "(collecting: one reading every "
+                                                 (number->string (k8s--metrics-interval)) "s)"))
+                                 (else #f)))
+                   (t0 (if (null? wl-epochs) now (apply min wl-epochs)))
+                   (hours? (> (- now t0) 10800))
+                   (scale (if hours? 3600.0 60.0))
+                   (unit (if hours? "hours" "minutes"))
+                   (top (lambda (f)
+                          (k8s--take (sort groups (lambda (a b) (> (f (last (cdr a))) (f (last (cdr b))))))
+                                     5)))
+                   (series (lambda (f)
+                             (map (lambda (g)
+                                    (list (car g)
+                                          (map (lambda (r) (list (/ (- (car r) now) scale) (f r))) (cdr g))))
+                                  (top f)))))
+              (k8s--chart-section 'k8s-m-wlcpu
+                (string-append "Workload CPU per pod (millicores) · top 5 · x: " unit " ago") wl-why
+                (and (not wl-why)
+                     (lines (series k8s--wl-avg-cpu) 'width 60 'height 8 'x-max 0 'legend #t)))
+              (k8s--chart-section 'k8s-m-wlmem
+                (string-append "Workload memory per pod (MiB) · top 5 · x: " unit " ago") wl-why
+                (and (not wl-why)
+                     (lines (series k8s--wl-avg-mem) 'width 60 'height 8 'x-max 0 'legend #t)))
+              (section-open 'k8s-m-wltable
+                            (string-append "Workloads (" (number->string (length groups))
+                                           ") · per pod, last " (k8s--fmt-span (- now t0)))
+                            "k8s-section")
+              (if (null? groups)
+                  (section-line (string-append "    " (if ok no-pods pod-why)) "k8s-dim")
+                  (k8s--emit-workload-table
+                   (sort groups (lambda (a b) (> (k8s--wl-avg-cpu (last (cdr a)))
+                                                 (k8s--wl-avg-cpu (last (cdr b))))))
+                   t0 now))
+              (section-close 'k8s-m-wltable)
+              (section-line "" #f))
+            ;; 4. Heaviest pods (latest pod reading, in the selected namespace).
+            (let ((cpu-top (k8s--top-pods 8 1)) (mem-top (k8s--top-pods 8 2)))
+              (k8s--chart-section 'k8s-m-topcpu "Top pods by CPU (millicores)" pod-why
+                (and ok (not (null? cpu-top))
+                     (bars (map (lambda (p) (list (k8s--chart-pod-name (car p)) (cadr p))) cpu-top)
+                           'width 40 'face "plot-series-0")))
+              (k8s--chart-section 'k8s-m-topmem "Top pods by memory (MiB)" pod-why
+                (and ok (not (null? mem-top))
+                     (bars (map (lambda (p) (list (k8s--chart-pod-name (car p)) (nth p 2))) mem-top)
+                           'width 40 'face "plot-series-1"))))
+            ;; 5. Memory distribution across pods.
+            (let ((mems (map (lambda (p) (nth p 2)) (k8s--pods-now))))
+              (k8s--chart-section 'k8s-m-dist "Pod memory distribution (MiB)" pod-why
+                (and ok (>= (length mems) 2)
+                     (histo mems 'bins 12 'height 6 'face "plot-series-1"))))
+            ;; 6. Pod health (kubectl get pods; no metrics needed).
+            (k8s--emit-pod-health bars no-pods))
+          (if quiet
+              (render-buffer-quiet "*k8s-metrics*" "k8s-metrics-mode" (section-text) (section-line-faces))
+              (begin
+                ;; In place: point's line and the scroll position are kept (no goto-line).
+                (section-render "*k8s-metrics*" "k8s-metrics-mode")))
+          (k8s--st! 'built "*k8s-metrics*")))))
+
+(define-command (k8s-metrics)
+  (k8s--resolve-context!)
+  (when (not (k8s--st 'ns-resolved))
+    (k8s--resolve-namespace!)
+    (k8s--st! 'ns-resolved #t))
+  (k8s--render-metrics #f #t))
+
+;; A in the metrics buffer: toggle all namespaces and redraw the charts.
+(define-command (k8s-metrics-toggle-all-namespaces)
+  (k8s--st! 'all-ns (not (k8s--st 'all-ns)))
+  (k8s--st! 'metrics (hash))   ; the pod readings were for the other scope
+  (k8s--render-metrics #f #t))
 
 ;; Pods, grouped by owning workload. The `-o wide` rows give the display columns
 ;; (rich STATUS, restarts, node); a second custom-columns query resolves each
@@ -517,7 +1044,7 @@
      "k8s-header")
     (section-line
      (string-append "  r refresh · TAB fold · d describe · l logs · s shell/scale · S full shell · "
-                    "y yaml · x delete · N ns · A all-ns · C ctx · a auto · ? more · q quit")
+                    "y yaml · x delete · N ns · A all-ns · C ctx · a auto · M metrics · ? more · q quit")
      "k8s-dim")
     (section-line "" #f)))
 
@@ -527,7 +1054,7 @@
 ;; which re-apply on the next in-front render. The interactive path preserves
 ;; point and re-applies folds.
 (define (k8s--render quiet)
-  (let ((line (if (equal? (current-buffer) "*k8s-dashboard*") (buffer-line) 0)))
+  (let ()
     (k8s--resolve-context!)
     (k8s--st! 'linemap '())
     (section-begin)
@@ -541,8 +1068,10 @@
     (if quiet
         (render-buffer-quiet "*k8s-dashboard*" "k8s-mode" (section-text) (section-line-faces))
         (begin
-          (section-render "*k8s-dashboard*" "k8s-mode")
-          (goto-line line)))))
+          ;; An in-place render keeps point's line and the scroll position on
+          ;; its own; a goto-line here would scroll the view back to point.
+          (section-render "*k8s-dashboard*" "k8s-mode")))
+    (k8s--st! 'built "*k8s-dashboard*")))
 
 (define-command (k8s-refresh) (k8s--render #f))
 ;; In-place refresh that never steals focus — for the background auto-refresh.
@@ -555,10 +1084,21 @@
   (when (not (k8s--st 'ns-resolved))
     (k8s--resolve-namespace!)
     (k8s--st! 'ns-resolved #t))
-  (k8s-refresh))
+  (k8s-refresh)
+  ;; Keep the metrics history growing while the dashboard is open (no-op on
+  ;; editors without plot.scm).
+  (when (k8s--plot-fn "plot-lines") (k8s--sampler-arm!)))
 
 ;; ── navigation / fold ─────────────────────────────────────────────────────────
-(define-command (k8s-toggle-fold) (section-toggle-at-point))
+;; lib-section keeps ONE set of sections — the last buffer built. With both the
+;; dashboard and the metrics buffer open, rebuild this one first if the other was
+;; built since (a background refresh), or TAB would fold by the wrong layout.
+(define-command (k8s-toggle-fold)
+  (let ((buf (current-buffer)))
+    (when (not (equal? buf (k8s--st 'built)))
+      (cond ((equal? buf "*k8s-dashboard*") (k8s--render #f))
+            ((equal? buf "*k8s-metrics*") (k8s--render-metrics #f #f))))
+    (section-toggle-at-point)))
 
 ;; The resource on the current line, as (line kind name ns), or #f.
 (define (k8s--resource-at)
@@ -804,6 +1344,7 @@
                     (list "shift-a" "All namespaces" 'k8s-toggle-all-namespaces)
                     (list "shift-c" "Context"    'k8s-set-context)
                     (list "a" "Auto-refresh"     'k8s-toggle-auto)
+                    (list "shift-m" "Metrics charts" 'k8s-metrics)
                     (list "q" "Close"            'transient-quit))))))))
 
 ;; ── auto-refresh polling ──────────────────────────────────────────────────────
@@ -854,6 +1395,20 @@
 (define-key "k8s-mode" "n" 'next-line)
 (define-key "k8s-mode" "p" 'previous-line)
 (define-key "k8s-mode" "q" 'kill-buffer)
+(define-key "k8s-mode" "shift-m" 'k8s-metrics)     ; M — the metrics charts
+
+;; Metrics buffer: r samples now, D jumps back to the dashboard.
+(set-option "line-numbers:k8s-metrics-mode" "false")
+(define-command (k8s-metrics-refresh) (k8s--render-metrics #f #t))
+(define-key "k8s-metrics-mode" "r" 'k8s-metrics-refresh)
+(define-key "k8s-metrics-mode" "g" 'k8s-metrics-refresh)
+(define-key "k8s-metrics-mode" "tab" 'k8s-toggle-fold)
+(define-key "k8s-metrics-mode" "enter" 'k8s-toggle-fold)
+(define-key "k8s-metrics-mode" "shift-a" 'k8s-metrics-toggle-all-namespaces)
+(define-key "k8s-metrics-mode" "shift-d" 'k8s-dashboard)
+(define-key "k8s-metrics-mode" "n" 'next-line)
+(define-key "k8s-metrics-mode" "p" 'previous-line)
+(define-key "k8s-metrics-mode" "q" 'kill-buffer)
 
 ;; Detail buffers: describe / yaml / logs. `y y` copies the current line, `Y` the
 ;; whole buffer (real vim yank can't reach these read-only buffers — see
@@ -895,6 +1450,11 @@
   (define-key km "n" 'evil-search-next))
 (k8s--bind-status-motion "evil-normal:k8s-mode")
 (k8s--bind-status-motion "helix-normal:k8s-mode")
+(k8s--bind-status-motion "evil-normal:k8s-metrics-mode")
+(k8s--bind-status-motion "helix-normal:k8s-metrics-mode")
+;; `g r` there refreshes the charts, not the dashboard.
+(define-key "evil-normal:k8s-metrics-mode" "g r" 'k8s-metrics-refresh)
+(define-key "helix-normal:k8s-metrics-mode" "g r" 'k8s-metrics-refresh)
 
 ;; Detail / log buffers are read-only text you scroll like a file, so they earn
 ;; the full read-only motion set (matching evil-collection's read-only modes).

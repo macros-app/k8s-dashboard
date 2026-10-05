@@ -82,6 +82,7 @@ In the `*k8s-dashboard*` buffer:
 | `A`          | toggle all-namespaces view (`kubectl -A`)                               |
 | `C`          | switch context (`config use-context`, completion)                       |
 | `a`          | toggle auto-refresh polling                                              |
+| `M`          | open the metrics charts (`*k8s-metrics*`, see below)                     |
 | `?`          | actions popup for the resource at point                                 |
 | `q`          | close the buffer                                                         |
 
@@ -209,6 +210,51 @@ web-7d9f-abcde   1/1   Running   …   ▃▆█▅▆▇          300m   ▇▇
 Every refresh takes one `kubectl top pods` reading and keeps the last 16 per pod (`*k8s-spark-samples*`), so the lines fill in as you refresh. Turn on auto-refresh (`a`) to sample every 5 seconds. Each sparkline is scaled from zero to that pod's own recent peak.
 
 The sparklines need an editor with text charts (`plot.scm`). On older editors, or when `kubectl top` fails because metrics-server isn't installed, pod rows look exactly as before. A failed `kubectl top` is retried every 12 refreshes rather than on each one.
+
+## Metrics charts
+
+`M` on the dashboard (or `M-x k8s-metrics`) opens `*k8s-metrics*`, a buffer of text charts:
+
+| Chart | Shows | Source |
+| --- | --- | --- |
+| Cluster CPU over time | total CPU in cores, summed over nodes | stored `kubectl top nodes` history |
+| Cluster memory over time | total memory in GiB | stored history |
+| Node utilization | CPU % and memory % per node, at the latest reading | stored history |
+| Node CPU over time | a heatmap, one row per node, the stored window in 60 time columns (oldest left) | stored history |
+| Workload CPU / memory over time | average per pod for the 5 heaviest workloads (Deployments, StatefulSets, …), one line each | stored `kubectl top pods` history, per workload |
+| Workloads | every workload: CPU and memory sparklines over the stored window (average per pod), current averages, pod count | stored workload history |
+| Top pods by CPU / by memory | the 8 heaviest pods in the selected namespace, now | `kubectl top pods` |
+| Pod memory distribution | a histogram of every pod's memory | `kubectl top pods` |
+| Pod health | pods per status, each bar in its status color, plus the most-restarted pods | `kubectl get pods` |
+
+```
+Cluster CPU (cores) · x: hours ago
+2.0 ┤
+    │⠤⠤⠤⣀⣀⣀⣀
+    │       ⠉⠉⠒⠒⠒⠒⠤⠤⠤⠤⣀⣀
+1.8 ┤                   ⠉⠉⠉⠉⠒⠒⠒⠒⠤⠤⠤⠤⣀⡀                          ⡜
+    │                                ⠈⠉⠉⠉⠑⠒⠒⠒⠢⠤⠤⠤⢄⣀⡀           ⡸
+1.6 ┤                                              ⠈⠉⠉⠉⠑⠒⠒⠒⠢⠤⠤⠴⠁
+    └────────────────────────────────────────────────────────────
+     -5                                                         0
+```
+
+### History
+
+While the dashboard or the metrics buffer is open, a background sampler takes a `kubectl top nodes` and a `kubectl top pods` reading every 60 seconds and stores them, so the charts over time fill in and stay filled in across restarts. Readings older than 24 hours are dropped each time a new one is stored. Change either in `init.scm`:
+
+```scheme
+(set-option "k8s-metrics-interval" 30)          ; seconds between readings (default 60)
+(set-option "k8s-metrics-retention-hours" 72)   ; how long readings are kept (default 24)
+```
+
+Each context keeps its own history in `~/.config/macros/k8s-metrics/`: `<context>.tsv` for nodes and `<context>.workloads.tsv` for workloads (one reading per line; delete a file to start over).
+
+Pods come and go, so pod usage is stored per workload, the same grouping the dashboard uses (a Deployment's pods, via their ReplicaSet). Each reading keeps the workload's CPU and memory summed over its pods, plus the pod count, so a chart can show the average per pod even as a Deployment scales. In the Workloads table a sparkline holds its last value between readings and starts blank before a workload's first one. The time axis is in minutes, or in hours once the history spans more than 3 hours. `r` takes a reading right away.
+
+The pod charts follow the namespace you've selected; `A` in the metrics buffer switches to all namespaces. `TAB` folds a chart, `D` returns to the dashboard.
+
+The usage charts need metrics-server; without it they say so, and Pod health still works. All charts need an editor with text charts (`plot.scm`); on older editors `M` just reports that.
 
 ## Copying to the clipboard
 
