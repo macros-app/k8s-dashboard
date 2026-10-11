@@ -1,4 +1,4 @@
-# macros-k8s
+# k8s-dashboard
 
 A Kubernetes dashboard for the [macros](https://github.com/kylegwinnup/macros)
 editor, written in Steel — a magit-style porcelain for `kubectl`.
@@ -32,13 +32,11 @@ pod shell), `lib-transient` (the `?` popup), and `run-with-timer` (auto-refresh)
 
 ## Install
 
-Add this to your `init.scm` — the package is cloned from git on first launch (the
-entry file is `macros-k8s.scm`, so name it explicitly since the repo is
-`k8s-dashboard`):
+Add this to your `init.scm` — the package is cloned from git on first launch and
+its entry file, `k8s-dashboard.scm`, is loaded:
 
 ```scheme
-(package-install "https://codeberg.org/macros-app/k8s-dashboard"
-  'entry "macros-k8s.scm")
+(package-install "https://codeberg.org/macros-app/k8s-dashboard")
 ```
 
 To use `/bin/sh` instead of the default `/bin/bash` for the pod shell, set it in
@@ -46,7 +44,6 @@ the package's `'config` thunk (runs after the package loads):
 
 ```scheme
 (package-install "https://codeberg.org/macros-app/k8s-dashboard"
-  'entry  "macros-k8s.scm"
   'config (lambda () (set-option "k8s-shell" "/bin/sh")))
 ```
 
@@ -255,7 +252,7 @@ replica count), so the one key does the sensible thing for whatever's under poin
 auto-detects into yaml highlighting and every keymap works exactly as it does in
 any file — full evil/helix/emacs motion, `/` search, `yy` yank, marks, the lot.
 Re-running `y` on the same resource re-reads the current YAML in place. The temp
-files live under `$TMPDIR/macros-k8s/`.
+files live under `$TMPDIR/k8s-dashboard/`.
 
 ## Logs
 
@@ -291,7 +288,7 @@ the last one exits. The header shows when that was and how long it took.
 Vim/helix `y` yank does **not** work in these buffers — it's a constraint of how
 the editor overlays modal keys on special read-only buffers (magit and dired have
 it too): only *motion* is layered on, so the visual `y` operator never runs and a
-yank reaches neither the kill-ring nor the OS clipboard. macros-k8s binds explicit
+yank reaches neither the kill-ring nor the OS clipboard. k8s-dashboard binds explicit
 copy commands instead, all via `clipboard-set` (so `cmd-v` in another app works):
 
 | Buffer            | Key  | Copies                        |
@@ -314,7 +311,7 @@ Two settings live in the editor's **option store**, so you can set them any time
 (set-option "k8s-node-group-label" "topology.kubernetes.io/zone")  ; node grouping ("" = auto)
 ```
 
-The rest are Scheme vars — to change one, edit its default in `macros-k8s.scm`
+The rest are Scheme vars — to change one, edit its default in `k8s-dashboard.scm`
 (a pre-load `(define …)` in `init.scm` won't take; see the note below):
 
 | Var                   | Default     | Meaning                          |
@@ -349,7 +346,7 @@ them in the package's `'config` hook (or anywhere after it loads) so they land o
 top of the defaults:
 
 ```scheme
-(package-install-local "~/workspace/macros-k8s"
+(package-install-local "~/workspace/k8s-dashboard"
   'config (lambda ()
             ;; Emacs keys (and the base map under evil/helix)
             (define-key "k8s-mode" "e" 'k8s-logs)

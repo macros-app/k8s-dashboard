@@ -1,4 +1,4 @@
-;;; macros-k8s — a Kubernetes dashboard for the macros editor, in Steel.
+;;; k8s-dashboard — a Kubernetes dashboard for the macros editor, in Steel.
 ;;;
 ;;; A magit-style porcelain for `kubectl`. It sits on the same editor primitives
 ;;; magit.scm / macros-jj use — the Rust core knows nothing about k8s:
@@ -280,7 +280,7 @@
 (define k8s--fetch-script
   "out=$1; shift; mkdir -p \"${out%/*}\"; \"$@\" >\"$out\" 2>\"$out.err\"")
 (define (k8s--fetch-path key)
-  (string-append (k8s--tmpdir) "/macros-k8s/fetch-" (symbol->string key)))
+  (string-append (k8s--tmpdir) "/k8s-dashboard/fetch-" (symbol->string key)))
 
 ;; make-process callbacks are global names called with just the line / exit
 ;; code, so each key gets its own exit callback.
@@ -1511,7 +1511,7 @@
                (out  (k8s--run (append (list "get" kind name "-o" "yaml")
                                        (k8s--ns-args-for r))))
                (slug (k8s--yaml-slug ns kind name))
-               (path (string-append (k8s--tmpdir) "/macros-k8s/" slug)))
+               (path (string-append (k8s--tmpdir) "/k8s-dashboard/" slug)))
           (write-file path (if (k8s--blank? out) "# (no output)\n" (trim-end out)))
           (kill-buffer-named slug)   ; drop a stale view so find-file re-reads
           (open-file path))
